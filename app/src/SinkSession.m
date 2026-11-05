@@ -74,6 +74,7 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
     NSString *_sockPath;
     int _mediaFD;
     NSTimer *_tick, *_connectTimeout;
+    id<NSObject> _activity;   // keeps App Nap / timer coalescing away while connected
     int _ticks;
     double _reportedDelayMs;
     // media thread state
@@ -179,6 +180,7 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
     if (_helperPID > 0) { kill(_helperPID, SIGTERM); waitpid(_helperPID, NULL, WNOHANG); _helperPID = 0; }
     if (_sockPath) unlink(_sockPath.fileSystemRepresentation);
     if (_mediaFD >= 0) shutdown(_mediaFD, SHUT_RDWR);   // media thread closes it and stops the player
+    if (_activity) { [NSProcessInfo.processInfo endActivity:_activity]; _activity = nil; }
     self.state = SinkStateEnded;
 }
 
@@ -388,6 +390,9 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
     if (fd < 0) { [self endWithReason:@"Audio channel failed to open"]; return; }
     _mediaFD = fd;
     [_connectTimeout invalidate]; _connectTimeout = nil;
+    _activity = [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep |
+                                                                     NSActivityLatencyCritical
+                                                             reason:@"Receiving Bluetooth audio"];
     self.codecDescription = @"AAC";
     self.state = SinkStateReady;
     BABLog(@"Audio channel open; ready for audio");
@@ -474,8 +479,9 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
         if (p && self.state == SinkStateStreaming && fabs(self.delayMs - _reportedDelayMs) >= 25)
             [self sendDelayReport:self.delayMs];
         if (self.state == SinkStateStreaming)
-            BABLog(@"stats: %.0f kbit/s, delay %.0f ms, buffer %.0f ms, rate %.4f, underruns %llu, lost %llu",
-                   self.bitrateKbps, self.delayMs, p.bufferedMs, p.playbackRatio, self.underruns, self.lostPackets);
+            BABLog(@"stats: %.0f kbit/s, delay %.0f ms, buffer %.0f/%.0f ms, rate %.4f, underruns %llu, catch-ups %llu, lost %llu",
+                   self.bitrateKbps, self.delayMs, p.bufferedMs, p.targetLatencyMs, p.playbackRatio, self.underruns,
+                   p.catchUps, self.lostPackets);
     }
 }
 

@@ -8,6 +8,7 @@
 
 static const int kQueueBuffers = 3;
 static const UInt32 kQueueBufferFrames = 512;   // ~11.6 ms at 44.1 kHz
+static const double kCatchUpThresholdMs = 200;  // skip back to target when this much extra audio is queued
 
 typedef struct {
     const uint8_t *data;
@@ -65,7 +66,7 @@ static double deviceLatencyMs(NSString *uid);
     if (!(self = [super init])) return nil;
     _rate = sampleRate; _channels = channels;
     _volume = 1.0f;
-    _targetLatencyMs = 180; _minTargetMs = 180; _maxTargetMs = 450; _maxLatencyMs = 1000; _playbackRatio = 1.0;
+    _targetLatencyMs = 180; _minTargetMs = 180; _maxTargetMs = 300; _maxLatencyMs = 1000; _playbackRatio = 1.0;
     _lock = OS_UNFAIR_LOCK_INIT;
     _ringCap = (size_t)sampleRate * channels * 2;   // 2 s
     _ring = calloc(_ringCap, sizeof(float));
@@ -175,6 +176,20 @@ static OSStatus inputProc(AudioConverterRef c, UInt32 *ioNum, AudioBufferList *i
     double fillMs = availFrames * 1000.0 / _rate;
     size_t targetFrames = (size_t)(_targetLatencyMs / 1000.0 * _rate);
     if (_prebuffering && availFrames >= targetFrames) { _prebuffering = NO; _smoothedFillMs = fillMs; _readFrac = 0; }
+    BOOL fadeIn = NO;
+    if (!_prebuffering && fillMs > _targetLatencyMs + kCatchUpThresholdMs) {
+        // A radio stall just delivered a burst: rather than playing late audio for the next minute,
+        // skip straight back to the target (with a short fade-in to avoid a click).
+        size_t skip = availFrames - targetFrames;
+        _ringRead = (_ringRead + skip * ch) % _ringCap;
+        _ringFill -= skip * ch;
+        _droppedSamples += skip * ch;
+        _catchUps++;
+        availFrames = targetFrames;
+        fillMs = _smoothedFillMs = _targetLatencyMs;
+        _readFrac = 0;
+        fadeIn = YES;
+    }
     if (!_prebuffering) {
         _smoothedFillMs += 0.02 * (fillMs - _smoothedFillMs);
         double err = (_smoothedFillMs - _targetLatencyMs) / _targetLatencyMs;   // e.g. +0.5 = 50% over
@@ -204,11 +219,17 @@ static OSStatus inputProc(AudioConverterRef c, UInt32 *ioNum, AudioBufferList *i
             // The first 3 s of a stream are exempt: sources start with an irregular burst.
             if (_callbacksSinceStart > (uint64_t)(3.0 * _rate / kQueueBufferFrames))
                 _targetLatencyMs = fmin(_maxTargetMs, _targetLatencyMs + 40);
-        } else if (++_callbacksSinceUnderrun % (uint64_t)(20.0 * _rate / kQueueBufferFrames) == 0) {
-            _targetLatencyMs = fmax(_minTargetMs, _targetLatencyMs - 10);   // 20 s clean: shrink slowly
+        } else if (++_callbacksSinceUnderrun % (uint64_t)(5.0 * _rate / kQueueBufferFrames) == 0) {
+            _targetLatencyMs = fmax(_minTargetMs, _targetLatencyMs - 10);   // 5 s clean: shrink
         }
     }
     os_unfair_lock_unlock(&_lock);
+    if (fadeIn) {
+        for (size_t i = 0; i < written; i++) {
+            float g = (float)i / (float)written;
+            for (size_t c = 0; c < ch; c++) out[i * ch + c] *= g;
+        }
+    }
     for (size_t i = written * ch; i < wantFrames * ch; i++) out[i] = 0;
     buf->mAudioDataByteSize = (UInt32)(wantFrames * ch * sizeof(float));
 }

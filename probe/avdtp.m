@@ -32,6 +32,7 @@ void probeLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 @protocol BABClassicPeer
 - (void)setConnectL2CAPCallback:(void (^)(CBL2CAPChannel *ch, long code))cb;
 - (id)openL2CAPChannel:(unsigned long)psm;
+- (void)sendMsg:(int)msg args:(NSDictionary *)args;   // CBPeer -> bluetoothd XPC
 @end
 
 static const unsigned long kPSM_AVDTP = 0x19;
@@ -87,8 +88,17 @@ static int transportMain(NSString *addr, NSString *sockPath) {
         close(c);
         if (fd < 0) exit(4);
     }];
-    [peer openL2CAPChannel:kPSM_AVDTP];
-    L(@"[transport] opening media channel...");
+    const char *mtuEnv = getenv("BAB_INMTU");
+    if (mtuEnv && atoi(mtuEnv) > 0) {
+        // Same XPC message (29) CBClassicPeer -openL2CAPChannel: sends, but with an incoming MTU option.
+        int mtu = atoi(mtuEnv);
+        [(id)peer sendMsg:29 args:@{@"kCBMsgArgPSM": @(kPSM_AVDTP),
+                                    @"kCBMsgArgOptions": @{@"kCBL2CAPChannelInMTU": @(mtu), @"kCBL2CAPChannelMaxIncomingPayloadSize": @(mtu), @"kCBL2CAPChannelInMPS": @(mtu)}}];
+        L(@"[transport] opening media channel with inMTU=%d...", mtu);
+    } else {
+        [peer openL2CAPChannel:kPSM_AVDTP];
+        L(@"[transport] opening media channel...");
+    }
     // Stay alive while the parent uses the socket; the parent kills us on exit.
     while (getppid() != 1) [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:1]];
     (void)keep;
@@ -514,7 +524,8 @@ int avdtpMain(int argc, const char *argv[]) {
     if (argc >= 4 && !strcmp(argv[1], "--transport")) return transportMain(@(argv[2]), @(argv[3]));
     if (!strcmp(argv[1], "--caps")) gCapsOnly = YES;
     if (argc >= 5 && !strcmp(argv[4], "sbc")) gWantCodec = 0x00;
-    if (argc >= 6) gDeviceUID = @(argv[5]);
+    if (argc >= 6 && strcmp(argv[5], "-")) gDeviceUID = @(argv[5]);
+    if (argc >= 7) setenv("BAB_INMTU", argv[6], 1);   // inherited by the transport helper
     if (argc < 3) { L(@"usage: --sink <addr> [seconds] [aac|sbc]"); return 1; }
     int seconds = argc >= 4 ? atoi(argv[3]) : 60;
     Sink *s = [Sink new];
