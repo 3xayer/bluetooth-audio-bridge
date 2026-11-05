@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>local.bluetooth-audio-bridge.probe</string>
+	<key>CFBundleName</key>
+	<string>BT Audio Bridge Probe</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Probe whether this Mac can act as a Bluetooth speaker.</string>
+</dict>
+</plist>
