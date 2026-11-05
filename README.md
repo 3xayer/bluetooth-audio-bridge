@@ -41,11 +41,19 @@ Afterwards you can turn ADB debugging off again.
 ### 2. Build and install the app
 
 ```bash
+app/make-signing-cert.sh   # once per Mac: local self-signed code-signing identity
 app/build.sh install
 ```
 
-This builds `Bluetooth Audio Bridge.app` and copies it to `/Applications`. On first launch, allow
-Bluetooth access when macOS asks.
+This builds `Bluetooth Audio Bridge.app`, signs it, copies it to `/Applications` and starts it. On
+first launch, allow Bluetooth access when macOS asks. With the local signing identity, rebuilds keep
+the same code identity, so macOS doesn't ask again and the login item keeps working.
+
+Unit tests (AVDTP message splitting, the jitter buffer/resampler, and the LATM parser):
+
+```bash
+app/tests/run.sh
+```
 
 ## Using it
 
@@ -69,8 +77,14 @@ to hear the TV again.
 
 - **Quality:** AAC LC 44.1 kHz stereo at about 225 kbit/s. The Fire TV caps AAC frames to the
   Bluetooth packet size macOS uses (672 bytes). LDAC isn't possible because no decoder exists.
-- **Latency:** About 200–450 ms, adapting to radio conditions. It's compensated for video via delay
-  reports. Sound for interactive things like menus and games will lag a little.
+- **Latency:** Each stream starts with a 200 ms buffer, which shrinks to 120 ms while the link is clean
+  and grows (up to 300 ms) after dropouts. Total delay is about 160–300 ms. It's compensated for video
+  via delay reports.
+- **Remote volume:** The Fire TV remote's volume buttons work. The Fire TV scales the audio itself,
+  because macOS doesn't offer AVRCP absolute volume to it. The app's Volume slider is separate.
+- **Radio interference:** The Mac shares one radio between Wi-Fi, AirDrop/Continuity and Bluetooth.
+  Active AirDrop transfers can cause brief stutters. After any stall the app catches up immediately
+  instead of staying behind.
 - **Fragility:** The app uses **private macOS Bluetooth APIs** (`CBClassicPeer`), because the
   public ones can't open these channels any more. A future macOS update may break it.
 - **Reconnects:** Reconnects automatically after the connection drops and after the Mac wakes from

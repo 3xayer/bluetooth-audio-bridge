@@ -7,7 +7,7 @@
 #import "Log.h"
 
 static const int kQueueBuffers = 3;
-static const UInt32 kQueueBufferFrames = 512;   // ~11.6 ms at 44.1 kHz
+static const UInt32 kQueueBufferFrames = 256;   // ~5.8 ms at 44.1 kHz
 static const double kCatchUpThresholdMs = 200;  // skip back to target when this much extra audio is queued
 
 typedef struct {
@@ -29,6 +29,7 @@ typedef struct {
     double _smoothedFillMs, _readFrac, _deviceLatencyMs;
     uint64_t _callbacksSinceUnderrun;
     uint64_t _callbacksSinceStart;   // since creation / flush: start-of-stream grace period
+    float _prev[8];                  // last consumed frame (x[-1] for the cubic interpolator)
 }
 
 static double deviceLatencyMs(NSString *uid);
@@ -66,7 +67,7 @@ static double deviceLatencyMs(NSString *uid);
     if (!(self = [super init])) return nil;
     _rate = sampleRate; _channels = channels;
     _volume = 1.0f;
-    _targetLatencyMs = 180; _minTargetMs = 180; _maxTargetMs = 300; _maxLatencyMs = 1000; _playbackRatio = 1.0;
+    _targetLatencyMs = 200; _minTargetMs = 120; _maxTargetMs = 300; _maxLatencyMs = 1000; _playbackRatio = 1.0;
     _lock = OS_UNFAIR_LOCK_INIT;
     _ringCap = (size_t)sampleRate * channels * 2;   // 2 s
     _ring = calloc(_ringCap, sizeof(float));
@@ -163,10 +164,25 @@ static OSStatus inputProc(AudioConverterRef c, UInt32 *ioNum, AudioBufferList *i
 }
 
 // Pulls one queue buffer from the ring. While playing, the read speed is nudged by up to ±1%
-// (linear interpolation) so the buffer level converges to the target: this absorbs bursts and the
-// clock difference between the Fire TV and this Mac without dropping audio.
+// (4-point cubic Hermite interpolation) so the buffer level converges to the target: this absorbs
+// bursts and the clock difference between the Fire TV and this Mac without dropping audio.
+static inline float hermite(float xm1, float x0, float x1, float x2, float t) {
+    float c1 = 0.5f * (x1 - xm1);
+    float c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
+    float c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
+    return ((c3 * t + c2) * t + c1) * t + x0;
+}
+
+- (void)resetHistory {   // x[-1] := first queued frame (no discontinuity after a jump)
+    for (int c = 0; c < _channels && c < 8; c++) _prev[c] = _ringFill ? _ring[(_ringRead + c) % _ringCap] : 0;
+}
 - (void)fill:(AudioQueueBufferRef)buf {
-    float *out = buf->mAudioData;
+    [self render:buf->mAudioData];
+    buf->mAudioDataByteSize = (UInt32)(kQueueBufferFrames * (size_t)_channels * sizeof(float));
+}
+
+// Renders kQueueBufferFrames interleaved frames into out.
+- (void)render:(float *)out {
     const size_t ch = (size_t)_channels;
     const size_t wantFrames = kQueueBufferFrames;
     size_t written = 0;
@@ -175,7 +191,10 @@ static OSStatus inputProc(AudioConverterRef c, UInt32 *ioNum, AudioBufferList *i
     size_t availFrames = _ringFill / ch;
     double fillMs = availFrames * 1000.0 / _rate;
     size_t targetFrames = (size_t)(_targetLatencyMs / 1000.0 * _rate);
-    if (_prebuffering && availFrames >= targetFrames) { _prebuffering = NO; _smoothedFillMs = fillMs; _readFrac = 0; }
+    if (_prebuffering && availFrames >= targetFrames) {
+        _prebuffering = NO; _smoothedFillMs = fillMs; _readFrac = 0;
+        [self resetHistory];
+    }
     BOOL fadeIn = NO;
     if (!_prebuffering && fillMs > _targetLatencyMs + kCatchUpThresholdMs) {
         // A radio stall just delivered a burst: rather than playing late audio for the next minute,
@@ -188,6 +207,7 @@ static OSStatus inputProc(AudioConverterRef c, UInt32 *ioNum, AudioBufferList *i
         availFrames = targetFrames;
         fillMs = _smoothedFillMs = _targetLatencyMs;
         _readFrac = 0;
+        [self resetHistory];
         fadeIn = YES;
     }
     if (!_prebuffering) {
@@ -198,18 +218,21 @@ static OSStatus inputProc(AudioConverterRef c, UInt32 *ioNum, AudioBufferList *i
         double ratio = 1.0 + fmax(-0.01, fmin(maxUp, err * 0.02));
         _playbackRatio = ratio;
         double pos = _readFrac;
+#define RING(i, c) _ring[(_ringRead + (i) * ch + (c)) % _ringCap]
         for (; written < wantFrames; written++) {
             size_t i0 = (size_t)pos;
-            if (i0 + 1 >= availFrames) break;               // need two frames to interpolate
-            float f = (float)(pos - i0);
+            if (i0 + 2 >= availFrames) break;               // need x0..x2 (x[-1] may be history)
+            float t = (float)(pos - i0);
             for (size_t c = 0; c < ch; c++) {
-                float a = _ring[(_ringRead + i0 * ch + c) % _ringCap];
-                float b = _ring[(_ringRead + (i0 + 1) * ch + c) % _ringCap];
-                out[written * ch + c] = a + (b - a) * f;
+                float xm1 = i0 == 0 ? _prev[c] : RING(i0 - 1, c);
+                out[written * ch + c] = hermite(xm1, RING(i0, c), RING(i0 + 1, c), RING(i0 + 2, c), t);
             }
             pos += ratio;
         }
         size_t consumed = MIN((size_t)pos, availFrames);
+        if (consumed > 0)
+            for (size_t c = 0; c < ch && c < 8; c++) _prev[c] = RING(consumed - 1, c);
+#undef RING
         _readFrac = pos - (double)(size_t)pos;
         _ringRead = (_ringRead + consumed * ch) % _ringCap;
         _ringFill -= consumed * ch;
@@ -231,12 +254,24 @@ static OSStatus inputProc(AudioConverterRef c, UInt32 *ioNum, AudioBufferList *i
         }
     }
     for (size_t i = written * ch; i < wantFrames * ch; i++) out[i] = 0;
-    buf->mAudioDataByteSize = (UInt32)(wantFrames * ch * sizeof(float));
 }
+
+#ifdef BAB_TESTS
+- (void)testPushPCM:(const float *)pcm frames:(size_t)frames {
+    os_unfair_lock_lock(&_lock);
+    for (size_t i = 0; i < frames * _channels; i++) { _ring[(_ringRead + _ringFill) % _ringCap] = pcm[i]; _ringFill++; }
+    os_unfair_lock_unlock(&_lock);
+}
+- (size_t)testRender:(float *)out {
+    [self render:out];
+    return kQueueBufferFrames;
+}
+#endif
 
 - (void)flush {
     os_unfair_lock_lock(&_lock);
     _ringRead = 0; _ringFill = 0; _readFrac = 0; _prebuffering = YES; _callbacksSinceStart = 0;
+    memset(_prev, 0, sizeof _prev);
     os_unfair_lock_unlock(&_lock);
 }
 

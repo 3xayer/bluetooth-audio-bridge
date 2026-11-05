@@ -13,8 +13,8 @@
 - (double)estimatedOutputDelayMs;               // arrival -> speaker, for AVDTP delay reports
 @property(readonly) uint64_t framesDecoded, decodeErrors, underruns, droppedSamples, catchUps;
 @property(readonly) double rmsSinceLastQuery;   // read-and-reset loudness of decoded audio (0..1)
-@property double targetLatencyMs;               // jitter buffer level to hold, default 180
-@property double minTargetMs, maxTargetMs;      // adaptive range: +40 ms per underrun, -10 ms per clean 5 s (default 180-300)
+@property double targetLatencyMs;               // jitter buffer level to hold (adaptive)
+@property double minTargetMs, maxTargetMs;      // adaptive range: +40 ms per underrun, -10 ms per clean 5 s (default 120-300, starts at 200)
 @property double maxLatencyMs;                  // emergency: beyond this, drop audio back to target, default 1000
 @property(readonly) double playbackRatio;       // current rate correction (1.0 = nominal)
 @property(nonatomic) float volume;              // 0..1, applied to the output queue

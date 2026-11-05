@@ -2,6 +2,7 @@
 #import "AACPlayer.h"
 #import "Log.h"
 #include "latm.h"
+#include "avdtp_frame.h"
 #import <IOBluetooth/IOBluetooth.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 #include <spawn.h>
@@ -203,7 +204,13 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
     if (s == _in && (e & NSStreamEventHasBytesAvailable)) {
         uint8_t b[1024];
         NSInteger n = [_in read:b maxLength:sizeof b];
-        if (n >= 2) [self handle:b len:(size_t)n];
+        size_t pos = 0;
+        while (n > 0 && pos + 2 <= (size_t)n && !_ending) {
+            size_t len = avdtpMessageLength(b + pos, (size_t)n - pos);
+            if (pos > 0) BABLog(@"(split merged AVDTP messages)");
+            [self handle:b + pos len:len];
+            pos += len;
+        }
     }
     if (e & (NSStreamEventErrorOccurred | NSStreamEventEndEncountered)) {
         [self endWithReason:(e & NSStreamEventErrorOccurred) ? @"Connection lost" : @"Device closed the connection"];
@@ -479,9 +486,9 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
         if (p && self.state == SinkStateStreaming && fabs(self.delayMs - _reportedDelayMs) >= 25)
             [self sendDelayReport:self.delayMs];
         if (self.state == SinkStateStreaming)
-            BABLog(@"stats: %.0f kbit/s, delay %.0f ms, buffer %.0f/%.0f ms, rate %.4f, underruns %llu, catch-ups %llu, lost %llu",
+            BABLog(@"stats: %.0f kbit/s, delay %.0f ms, buffer %.0f/%.0f ms, rate %.4f, underruns %llu, catch-ups %llu, lost %llu, level %.3f",
                    self.bitrateKbps, self.delayMs, p.bufferedMs, p.targetLatencyMs, p.playbackRatio, self.underruns,
-                   p.catchUps, self.lostPackets);
+                   p.catchUps, self.lostPackets, p.rmsSinceLastQuery);
     }
 }
 
