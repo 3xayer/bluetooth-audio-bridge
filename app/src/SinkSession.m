@@ -74,7 +74,8 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
     pid_t _helperPID;
     NSString *_sockPath;
     int _mediaFD;
-    NSTimer *_tick, *_connectTimeout;
+    NSTimer *_tick, *_connectTimeout, *_signalingRetry;
+    int _signalingAttempts;
     id<NSObject> _activity;   // keeps App Nap / timer coalescing away while connected
     int _ticks;
     double _reportedDelayMs;
@@ -146,12 +147,23 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
     [self openSignaling];
 }
 
+static const int kMaxSignalingAttempts = 5;
+
+// Open requests can be dropped or refused right after the link comes up, so retry a few times.
 - (void)openSignaling {
+    if (_ending || _sigCh) return;
+    _signalingAttempts++;
+    if (_signalingAttempts > 1) BABLog(@"Retrying signaling channel (attempt %d)", _signalingAttempts);
+    _peer = [_dev classicPeer] ?: _peer;
     __weak SinkSession *ws = self;
     [_peer setConnectL2CAPCallback:^(CBL2CAPChannel *ch, long code) {
         dispatch_async(dispatch_get_main_queue(), ^{ [ws signalingOpened:ch code:code]; });
     }];
     [_peer openL2CAPChannel:kPSM_AVDTP];
+    [_signalingRetry invalidate];
+    _signalingRetry = nil;
+    if (_signalingAttempts < kMaxSignalingAttempts)
+        _signalingRetry = [NSTimer scheduledTimerWithTimeInterval:3 repeats:NO block:^(NSTimer *t) { [ws openSignaling]; }];
 }
 
 - (void)stop {
@@ -174,11 +186,17 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
     self.endReason = reason;
     [_tick invalidate]; _tick = nil;
     [_connectTimeout invalidate]; _connectTimeout = nil;
+    [_signalingRetry invalidate]; _signalingRetry = nil;
     _in.delegate = nil; _out.delegate = nil;
     [_in close]; [_out close];
     _in = nil; _out = nil; _sigCh = nil;
     [_peer setConnectL2CAPCallback:^(CBL2CAPChannel *ch, long code) {}];
-    if (_helperPID > 0) { kill(_helperPID, SIGTERM); waitpid(_helperPID, NULL, WNOHANG); _helperPID = 0; }
+    if (_helperPID > 0) {
+        pid_t helper = _helperPID;
+        _helperPID = 0;
+        kill(helper, SIGTERM);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ waitpid(helper, NULL, 0); });
+    }
     if (_sockPath) unlink(_sockPath.fileSystemRepresentation);
     if (_mediaFD >= 0) shutdown(_mediaFD, SHUT_RDWR);   // media thread closes it and stops the player
     if (_activity) { [NSProcessInfo.processInfo endActivity:_activity]; _activity = nil; }
@@ -188,8 +206,14 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
 #pragma mark - signaling
 
 - (void)signalingOpened:(CBL2CAPChannel *)ch code:(long)code {
-    if (_ending) return;
-    if (!ch) { [self endWithReason:[NSString stringWithFormat:@"Could not reach device (code %ld)", code]]; return; }
+    if (_ending || _sigCh) return;
+    if (!ch) {
+        BABLog(@"Signaling channel failed (code %ld, attempt %d)", code, _signalingAttempts);
+        if (_signalingAttempts >= kMaxSignalingAttempts)
+            [self endWithReason:[NSString stringWithFormat:@"Could not reach device (code %ld)", code]];
+        return;
+    }
+    [_signalingRetry invalidate]; _signalingRetry = nil;
     _sigCh = ch;
     _in = ch.inputStream; _out = ch.outputStream;
     _in.delegate = self; _out.delegate = self;
@@ -496,11 +520,10 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
 
 + (int)runTransportHelperWithAddress:(NSString *)address socketPath:(NSString *)path {
     IOBluetoothDevice *d = [IOBluetoothDevice deviceWithAddressString:address];
-    id<BABClassicPeer> peer = [d classicPeer];
     __block CBL2CAPChannel *keep = nil;
-    [peer setConnectL2CAPCallback:^(CBL2CAPChannel *ch, long code) {
-        int fd = ch ? [[ch valueForKey:@"socketFD"] intValue] : -1;
-        keep = ch;
+    __block BOOL shipped = NO;
+    // Hands the channel's socket (or -1 on failure) to the parent over the unix socket.
+    void (^ship)(int) = ^(int fd) {
         int c = socket(AF_UNIX, SOCK_STREAM, 0);
         struct sockaddr_un a = {.sun_family = AF_UNIX};
         strlcpy(a.sun_path, path.fileSystemRepresentation, sizeof a.sun_path);
@@ -518,9 +541,40 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
         }
         sendmsg(c, &m, 0);
         close(c);
-        if (fd < 0) exit(4);
-    }];
-    [peer openL2CAPChannel:kPSM_AVDTP];
+    };
+    void (^onOpen)(CBL2CAPChannel *, long) = ^(CBL2CAPChannel *ch, long code) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (shipped) return;
+            if (!ch) { BABLog(@"[helper] open failed (code %ld), will retry", code); return; }
+            shipped = YES;
+            keep = ch;
+            ship([[ch valueForKey:@"socketFD"] intValue]);
+        });
+    };
+
+    // This process's Bluetooth client takes a moment to reach the powered-on state, and an open
+    // request sent before that is silently dropped by CoreBluetooth ("API MISUSE"). There's no
+    // public way to observe that state on the classic peer, so wait briefly and keep retrying
+    // until the channel opens. The source gives up on the stream after about 10 s.
+    id<BABClassicPeer> peer = nil;
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:8.5];
+    NSDate *nextAttempt = [NSDate dateWithTimeIntervalSinceNow:0.3];
+    int attempts = 0;
+    while (!shipped && deadline.timeIntervalSinceNow > 0) {
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        if (shipped || nextAttempt.timeIntervalSinceNow > 0) continue;
+        peer = [d classicPeer];
+        if (!peer) { nextAttempt = [NSDate dateWithTimeIntervalSinceNow:0.25]; continue; }
+        [peer setConnectL2CAPCallback:onOpen];
+        [peer openL2CAPChannel:kPSM_AVDTP];
+        if (++attempts > 1) BABLog(@"[helper] retrying audio channel (attempt %d)", attempts);
+        nextAttempt = [NSDate dateWithTimeIntervalSinceNow:1.5];
+    }
+    if (!shipped) {
+        BABLog(@"[helper] gave up after %d attempts", attempts);
+        ship(-1);
+        return 4;
+    }
     // Keep the channel alive until the parent goes away (it SIGTERMs us when the session ends).
     while (getppid() != 1) [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:1]];
     (void)keep;
