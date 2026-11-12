@@ -76,15 +76,27 @@ to hear the TV again.
 ## Good to know
 
 - **Quality:** AAC LC 44.1 kHz stereo at about 225 kbit/s. The Fire TV caps AAC frames to the
-  Bluetooth packet size macOS uses (672 bytes). LDAC isn't possible because no decoder exists.
+  Bluetooth packet size macOS uses (672 bytes). LDAC isn't expected to start: Sony's encoder needs at least 679 bytes (open decoders do exist).
 - **Latency:** Each stream starts with a 200 ms buffer, which shrinks to 120 ms while the link is clean
   and grows (up to 300 ms) after dropouts. Total delay is about 160–300 ms. It's compensated for video
   via delay reports.
 - **Remote volume:** The Fire TV remote's volume buttons work. The Fire TV scales the audio itself,
   because macOS doesn't offer AVRCP absolute volume to it. The app's Volume slider is separate.
-- **Radio interference:** The Mac shares one radio between Wi-Fi, AirDrop/Continuity and Bluetooth.
-  Active AirDrop transfers can cause brief stutters. After any stall the app catches up immediately
-  instead of staying behind.
+- **Radio priority:** The Mac's Bluetooth chip also runs BLE scans and device searches. The biggest
+  one: with AirPods set to switch automatically, macOS scans 30 ms out of every 40 ms for ~15 s each
+  time you use the Mac after a short break. Without priority, the Fire TV's audio then gets only
+  ~60% through and drops out. The app therefore marks the Fire TV link as a high-priority stream
+  while it's connected (private bluetoothd message). In tests, the 75% scan and back-to-back device
+  searches then no longer cause dropouts. Waking the screen from sleep can still cause a ~2 s
+  hiccup. To turn it off: `defaults write local.bluetooth-audio-bridge linkPriority -bool NO`.
+  Active AirDrop transfers can cause brief stutters too. After any stall the app catches up
+  immediately instead of staying behind.
+- **Lower bit rate (optional):** `defaults write local.bluetooth-audio-bridge aacBitrate -int 128`
+  asks the Fire TV for 128 kbit/s AAC, which leaves more headroom for radio interference at some cost
+  in sound quality. Remove the key to go back to the maximum.
+- **Diagnostics:** `defaults write local.bluetooth-audio-bridge perSecondStats -bool YES` logs the
+  received rate every second. `probe/stall-test.py` uses it to fire individual system events
+  (BLE scan, device search, Wi-Fi scan, CPU/disk/network load, ...) and report which ones cause stalls.
 - **Fragility:** The app uses **private macOS Bluetooth APIs** (`CBClassicPeer`), because the
   public ones can't open these channels any more. A future macOS update may break it.
 - **Reconnects:** Reconnects automatically after the connection drops and after the Mac wakes from

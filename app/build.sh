@@ -11,7 +11,7 @@ cp Info.plist "$APP/Contents/Info.plist"
 
 clang -fobjc-arc -O2 -Wall -Wno-unused-function -mmacosx-version-min=13.0 \
   -o "$APP/Contents/MacOS/BluetoothAudioBridge" \
-  src/main.m src/AppDelegate.m src/SinkSession.m src/AACPlayer.m src/Log.m src/latm.c \
+  src/main.m src/AppDelegate.m src/SinkSession.m src/AACPlayer.m src/Log.m src/LinkPriority.m src/latm.c \
   -framework Cocoa -framework IOBluetooth -framework CoreBluetooth \
   -framework AudioToolbox -framework CoreAudio -framework ServiceManagement
 

@@ -7,8 +7,12 @@
 #import "Log.h"
 
 static const int kQueueBuffers = 3;
-static const UInt32 kQueueBufferFrames = 256;   // ~5.8 ms at 44.1 kHz
-static const double kCatchUpThresholdMs = 200;  // skip back to target when this much extra audio is queued
+// Must leave a clear margin over the output device's I/O cycle (10.7 ms on 48 kHz USB/DisplayPort
+// devices): 3 x 256 frames starved those devices while still being fine on the 5.3 ms built-in speakers.
+static const UInt32 kQueueBufferFrames = 512;   // ~11.6 ms at 44.1 kHz
+static const double kCatchUpThresholdMs = 350;  // skip back to target when this much extra audio is queued
+enum { kFadeFrames = 256 };                     // ~5.8 ms: fades and crossfades that keep cuts from clicking
+static const size_t kRunoutMarginFrames = 64;   // leave enough audio to fade out when a stall drains the buffer
 
 typedef struct {
     const uint8_t *data;
@@ -191,14 +195,21 @@ static inline float hermite(float xm1, float x0, float x1, float x2, float t) {
     size_t availFrames = _ringFill / ch;
     double fillMs = availFrames * 1000.0 / _rate;
     size_t targetFrames = (size_t)(_targetLatencyMs / 1000.0 * _rate);
+    BOOL fadeIn = NO, fadeOut = NO;
+    float oldAudio[kFadeFrames * 8];   // audio being skipped, crossfaded into the new position
+    size_t oldFrames = 0;
     if (_prebuffering && availFrames >= targetFrames) {
         _prebuffering = NO; _smoothedFillMs = fillMs; _readFrac = 0;
         [self resetHistory];
+        fadeIn = YES;
     }
-    BOOL fadeIn = NO;
     if (!_prebuffering && fillMs > _targetLatencyMs + kCatchUpThresholdMs) {
         // A radio stall just delivered a burst: rather than playing late audio for the next minute,
-        // skip straight back to the target (with a short fade-in to avoid a click).
+        // skip straight back to the target, crossfading so the jump doesn't click.
+        if (!fadeIn && ch <= 8) {
+            oldFrames = MIN(kFadeFrames, availFrames);
+            for (size_t i = 0; i < oldFrames * ch; i++) oldAudio[i] = _ring[(_ringRead + i) % _ringCap];
+        }
         size_t skip = availFrames - targetFrames;
         _ringRead = (_ringRead + skip * ch) % _ringCap;
         _ringFill -= skip * ch;
@@ -208,7 +219,6 @@ static inline float hermite(float xm1, float x0, float x1, float x2, float t) {
         fillMs = _smoothedFillMs = _targetLatencyMs;
         _readFrac = 0;
         [self resetHistory];
-        fadeIn = YES;
     }
     if (!_prebuffering) {
         _smoothedFillMs += 0.02 * (fillMs - _smoothedFillMs);
@@ -217,6 +227,8 @@ static inline float hermite(float xm1, float x0, float x1, float x2, float t) {
         double maxUp = err > 1.0 ? 0.02 : 0.01;
         double ratio = 1.0 + fmax(-0.01, fmin(maxUp, err * 0.02));
         _playbackRatio = ratio;
+        // About to run dry: end this buffer with a fade-out while there's still audio left for one.
+        BOOL runningOut = availFrames < wantFrames + kRunoutMarginFrames;
         double pos = _readFrac;
 #define RING(i, c) _ring[(_ringRead + (i) * ch + (c)) % _ringCap]
         for (; written < wantFrames; written++) {
@@ -236,8 +248,9 @@ static inline float hermite(float xm1, float x0, float x1, float x2, float t) {
         _readFrac = pos - (double)(size_t)pos;
         _ringRead = (_ringRead + consumed * ch) % _ringCap;
         _ringFill -= consumed * ch;
-        if (written < wantFrames) {
+        if (written < wantFrames || runningOut) {
             _underruns++; _prebuffering = YES; _callbacksSinceUnderrun = 0;
+            fadeOut = YES;
             // Adaptive jitter buffer: every underrun buys more headroom (delay reports keep A/V sync).
             // The first 3 s of a stream are exempt: sources start with an irregular burst.
             if (_callbacksSinceStart > (uint64_t)(3.0 * _rate / kQueueBufferFrames))
@@ -247,10 +260,24 @@ static inline float hermite(float xm1, float x0, float x1, float x2, float t) {
         }
     }
     os_unfair_lock_unlock(&_lock);
-    if (fadeIn) {
-        for (size_t i = 0; i < written; i++) {
-            float g = (float)i / (float)written;
+    if (oldFrames) {
+        size_t n = MIN(oldFrames, written);
+        for (size_t i = 0; i < n; i++) {
+            float g = (float)i / (float)n;
+            for (size_t c = 0; c < ch; c++) out[i * ch + c] = oldAudio[i * ch + c] * (1 - g) + out[i * ch + c] * g;
+        }
+    } else if (fadeIn) {
+        size_t n = MIN(kFadeFrames, written);
+        for (size_t i = 0; i < n; i++) {
+            float g = (float)i / (float)n;
             for (size_t c = 0; c < ch; c++) out[i * ch + c] *= g;
+        }
+    }
+    if (fadeOut) {
+        size_t n = MIN(kFadeFrames, written);
+        for (size_t i = 0; i < n; i++) {
+            float g = (float)(n - 1 - i) / (float)n;
+            for (size_t c = 0; c < ch; c++) out[(written - n + i) * ch + c] *= g;
         }
     }
     for (size_t i = written * ch; i < wantFrames * ch; i++) out[i] = 0;

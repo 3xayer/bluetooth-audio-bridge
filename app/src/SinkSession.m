@@ -1,6 +1,7 @@
 #import "SinkSession.h"
 #import "AACPlayer.h"
 #import "Log.h"
+#import "LinkPriority.h"
 #include "latm.h"
 #include "avdtp_frame.h"
 #import <IOBluetooth/IOBluetooth.h>
@@ -79,6 +80,7 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
     id<NSObject> _activity;   // keeps App Nap / timer coalescing away while connected
     int _ticks;
     double _reportedDelayMs;
+    double _lastTickTime;
     // media thread state
     LatmState _latm;
     volatile BOOL _playerNeedsRestart;
@@ -184,6 +186,7 @@ static const int kMaxSignalingAttempts = 5;
     _ending = YES;
     BABLog(@"Session ended: %@", reason);
     self.endReason = reason;
+    [BABLinkPriority.shared disable];
     [_tick invalidate]; _tick = nil;
     [_connectTimeout invalidate]; _connectTimeout = nil;
     [_signalingRetry invalidate]; _signalingRetry = nil;
@@ -310,13 +313,17 @@ static const int kMaxSignalingAttempts = 5;
 }
 
 - (void)configureAAC {
+    // Default 320 kbit/s; the source caps it to what fits the packet size (~225-235 kbit/s).
+    NSInteger kbps = [NSUserDefaults.standardUserDefaults integerForKey:@"aacBitrate"];
+    uint32_t bps = (uint32_t)((kbps >= 64 && kbps <= 320) ? kbps : 320) * 1000;
     uint8_t conf[] = {(uint8_t)(_remoteSEID << 2), (uint8_t)(kLocalSEID << 2),
                       0x01, 0x00,                 // media transport
                       0x07, 0x08, 0x00, 0x02,     // audio, MPEG-2/4 AAC
                       0x80,                       // MPEG-2 AAC LC
                       0x01, 0x04,                 // 44.1 kHz, stereo
-                      0x04, 0xE2, 0x00,           // CBR, 320 kbit/s (the source caps it to the packet size)
+                      (uint8_t)(bps >> 16 & 0x7F), (uint8_t)(bps >> 8), (uint8_t)bps,   // CBR, bit rate
                       0x08, 0x00};                // delay reporting
+    BABLog(@"Requesting AAC at %u kbit/s", bps / 1000);
     [self cmd:AV_SET_CONF payload:conf len:sizeof conf];
 }
 
@@ -427,7 +434,9 @@ static const int kMaxSignalingAttempts = 5;
     self.codecDescription = @"AAC";
     self.state = SinkStateReady;
     BABLog(@"Audio channel open; ready for audio");
-    _tick = [NSTimer scheduledTimerWithTimeInterval:1 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+    NSUUID *peerID = [(id)_peer respondsToSelector:@selector(identifier)] ? [(CBPeer *)_peer identifier] : nil;
+    [BABLinkPriority.shared enableForPeer:peerID];
+    _tick =[NSTimer scheduledTimerWithTimeInterval:1 target:self selector:@selector(tick) userInfo:nil repeats:YES];
     [NSRunLoop.mainRunLoop addTimer:_tick forMode:NSRunLoopCommonModes];
     NSThread *t = [[NSThread alloc] initWithTarget:self selector:@selector(mediaLoop) object:nil];
     t.qualityOfService = NSQualityOfServiceUserInteractive;
@@ -506,9 +515,21 @@ static const int kMaxSignalingAttempts = 5;
         self.delayMs = p.estimatedOutputDelayMs;
         self.underruns = p.underruns;
     }
+    // Diagnostics: `defaults write local.bluetooth-audio-bridge perSecondStats -bool YES` logs the
+    // received rate every second (for correlating radio stalls with system events).
+    double now = CFAbsoluteTimeGetCurrent();
+    if (self.state == SinkStateStreaming && _lastTickTime > 0 &&
+        [NSUserDefaults.standardUserDefaults boolForKey:@"perSecondStats"])
+        BABLog(@"s1: %.0f kbit/s, buffer %.0f ms, underruns %llu, lost %llu",
+               self.bitrateKbps / (now - _lastTickTime), p.bufferedMs, self.underruns, self.lostPackets);
+    _lastTickTime = now;
     if (++_ticks % 5 == 0) {
-        if (p && self.state == SinkStateStreaming && fabs(self.delayMs - _reportedDelayMs) >= 25)
-            [self sendDelayReport:self.delayMs];
+        // Diagnostics: `defaults write local.bluetooth-audio-bridge delayReportMs -int N` reports a fixed delay.
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        BOOL fixed = [defaults objectForKey:@"delayReportMs"] != nil;
+        double wanted = fixed ? [defaults doubleForKey:@"delayReportMs"] : self.delayMs;
+        if (p && self.state == SinkStateStreaming && fabs(wanted - _reportedDelayMs) >= (fixed ? 1 : 25))
+            [self sendDelayReport:wanted];
         if (self.state == SinkStateStreaming)
             BABLog(@"stats: %.0f kbit/s, delay %.0f ms, buffer %.0f/%.0f ms, rate %.4f, underruns %llu, catch-ups %llu, lost %llu, level %.3f",
                    self.bitrateKbps, self.delayMs, p.bufferedMs, p.targetLatencyMs, p.playbackRatio, self.underruns,

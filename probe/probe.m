@@ -130,9 +130,11 @@ void probeLog(NSString *fmt, ...) {
     logf_(@"%@", s);
 }
 int avdtpMain(int argc, const char *argv[]);
+int triggerMain(int argc, const char *argv[]);
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc >= 2 && !strcmp(argv[1], "--trigger")) return triggerMain(argc, argv);
         if (argc >= 2 && (!strcmp(argv[1], "--sink") || !strcmp(argv[1], "--caps") || !strcmp(argv[1], "--devices") || !strcmp(argv[1], "--decode-test") || !strcmp(argv[1], "--transport"))) return avdtpMain(argc, argv);
         if (argc >= 3 && !strcmp(argv[1], "--connect")) {      // test aid: bring the baseband link up
             IOBluetoothDevice *d = [IOBluetoothDevice deviceWithAddressString:@(argv[2])];
