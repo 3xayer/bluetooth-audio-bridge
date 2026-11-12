@@ -26,9 +26,21 @@ side itself.
 
 ## Setup
 
-### 1. Pair the Fire TV with the Mac (once)
+### 1. Build and install the app
 
-On the Fire TV: **Settings → My Fire TV → Developer options → ADB debugging: ON**
+```bash
+app/make-signing-cert.sh   # once per Mac: local self-signed code-signing identity
+app/build.sh install
+```
+
+This builds `Bluetooth Audio Bridge.app`, signs it, copies it to `/Applications` and starts it. On
+first launch, allow Bluetooth access when macOS asks. With the local signing identity, rebuilds keep
+the same code identity, so macOS doesn't ask again and the login item keeps working.
+
+### 2. Pair your source with the Mac (once)
+
+**Fire TV.** Its "Add Bluetooth device" list hides computers, so a small helper app on the Fire TV
+starts the pairing. On the Fire TV: **Settings → My Fire TV → Developer options → ADB debugging: ON**
 (if Developer options is missing: *About* → click the device name 7×). Note the IP address under
 *About → Network*.
 
@@ -42,22 +54,16 @@ firetv-helper/pair.sh <fire-tv-ip>
 Accept "Allow USB debugging" on the TV, then confirm the pairing code on **both** TV and Mac.
 Afterwards you can turn ADB debugging off again.
 
-### Phones and other devices
+**Phones and other devices.** Pair from the device: **Bluetooth → Pair new device**, pick the Mac (it
+shows up as a computer) and confirm the code on both sides.
 
-Pair from the phone: **Bluetooth → Pair new device**, pick the Mac (it shows up as a computer) and
-confirm the code on both sides. The ADB helper is only needed for the Fire TV, whose list hides
-computers. Then choose the phone under **Connect To** in the app's menu.
+### 3. Pick it in the menu
 
-### 2. Build and install the app
+Choose the device under **Connect To**. Tick it under **Connect Automatically** if the app should
+connect to it on its own (a Fire TV that was already paired when the app first started is ticked
+for you). Leave phones unticked, so the app doesn't take a phone's audio away from your headphones.
 
-```bash
-app/make-signing-cert.sh   # once per Mac: local self-signed code-signing identity
-app/build.sh install
-```
-
-This builds `Bluetooth Audio Bridge.app`, signs it, copies it to `/Applications` and starts it. On
-first launch, allow Bluetooth access when macOS asks. With the local signing identity, rebuilds keep
-the same code identity, so macOS doesn't ask again and the login item keeps working.
+### Tests
 
 Unit tests (AVDTP message splitting, the jitter buffer/resampler, and the LATM parser):
 
