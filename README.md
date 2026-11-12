@@ -133,3 +133,11 @@ app/            The menu bar app (Objective-C, built with clang; no Xcode projec
 firetv-helper/  Android helper app + pair.sh (one-time pairing over ADB)
 probe/          Development/diagnostic tool used while building this (scan, caps, raw capture, decode tests)
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE). The SBC decoder in `app/third_party/sbc` is Android's, under the Apache
+License 2.0 (see its [LICENSE](app/third_party/sbc/LICENSE)).
+
+This is a hobby project and not affiliated with Amazon, Apple, Google or Sony. Fire TV, AirPods,
+Pixel and LDAC are trademarks of their owners.
