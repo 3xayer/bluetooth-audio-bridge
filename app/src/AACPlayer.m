@@ -93,10 +93,17 @@ static double deviceLatencyMs(NSString *uid);
     pcm.mFramesPerPacket = 1;
     pcm.mBytesPerFrame = pcm.mBytesPerPacket = 4 * (UInt32)channels;
 
-    OSStatus st = AudioConverterNew(&in, &pcm, &_conv);
-    if (st) { BABLog(@"AudioConverterNew failed %d", (int)st); return nil; }
-    st = AudioConverterSetProperty(_conv, kAudioConverterDecompressionMagicCookie, 2, asc);
-    BABLog(@"AAC decoder ready (%d Hz, %d ch, ASC %02x %02x, cookie status %d)", sampleRate, channels, asc[0], asc[1], (int)st);
+    OSStatus st = noErr;
+    _decoderDelayFrames = 1024;
+    if (asc) {   // AAC; without an ASC the caller decodes itself and hands over PCM (SBC)
+        st = AudioConverterNew(&in, &pcm, &_conv);
+        if (st) { BABLog(@"AudioConverterNew failed %d", (int)st); return nil; }
+        st = AudioConverterSetProperty(_conv, kAudioConverterDecompressionMagicCookie, 2, asc);
+        BABLog(@"AAC decoder ready (%d Hz, %d ch, ASC %02x %02x, cookie status %d)", sampleRate, channels, asc[0], asc[1], (int)st);
+    } else {
+        _decoderDelayFrames = 128;
+        BABLog(@"PCM input ready (%d Hz, %d ch)", sampleRate, channels);
+    }
 
     if (playback) {
         st = AudioQueueNewOutput(&pcm, queueCallback, (__bridge void *)self, NULL, NULL, 0, &_queue);
@@ -135,6 +142,7 @@ static OSStatus inputProc(AudioConverterRef c, UInt32 *ioNum, AudioBufferList *i
 }
 
 - (BOOL)decodeFrame:(const uint8_t *)data length:(size_t)len {
+    if (!_conv) return NO;
     float pcm[2048 * 8];
     InputPacket p = {data, (UInt32)len, {0}, NO};
     UInt32 frames = 1024;
@@ -143,6 +151,11 @@ static OSStatus inputProc(AudioConverterRef c, UInt32 *ioNum, AudioBufferList *i
     if (st != noErr && st != 1) { _decodeErrors++; return NO; }
     if (frames == 0) return YES;   // decoder priming
     _framesDecoded++;
+    [self pushPCM:pcm frames:frames];
+    return YES;
+}
+
+- (void)pushPCM:(const float *)pcm frames:(size_t)frames {
     size_t n = frames * (size_t)_channels;
     double sq = 0;
     for (size_t i = 0; i < n; i++) sq += pcm[i] * pcm[i];
@@ -164,7 +177,6 @@ static OSStatus inputProc(AudioConverterRef c, UInt32 *ioNum, AudioBufferList *i
         _smoothedFillMs = _targetLatencyMs;
     }
     os_unfair_lock_unlock(&_lock);
-    return YES;
 }
 
 // Pulls one queue buffer from the ring. While playing, the read speed is nudged by up to ±1%
@@ -307,7 +319,7 @@ static inline float hermite(float xm1, float x0, float x1, float x2, float t) {
 - (double)estimatedOutputDelayMs {
     double buffer = _prebuffering ? _targetLatencyMs : _smoothedFillMs;
     double queue = kQueueBuffers * kQueueBufferFrames * 1000.0 / _rate;
-    double decoder = 1024 * 1000.0 / _rate;
+    double decoder = _decoderDelayFrames * 1000.0 / _rate;
     return buffer + queue + decoder + _deviceLatencyMs;
 }
 

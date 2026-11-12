@@ -11,9 +11,9 @@ cp Info.plist "$APP/Contents/Info.plist"
 
 clang -fobjc-arc -O2 -Wall -Wno-unused-function -mmacosx-version-min=13.0 \
   -o "$APP/Contents/MacOS/BluetoothAudioBridge" \
-  src/main.m src/AppDelegate.m src/SinkSession.m src/AACPlayer.m src/Log.m src/LinkPriority.m src/latm.c \
+  src/main.m src/AppDelegate.m src/SinkSession.m src/AACPlayer.m src/Log.m src/LinkPriority.m src/AVRCP.m src/MenuViews.m src/SystemVolume.m src/latm.c third_party/sbc/srce/*.c -Ithird_party/sbc/include \
   -framework Cocoa -framework IOBluetooth -framework CoreBluetooth \
-  -framework AudioToolbox -framework CoreAudio -framework ServiceManagement
+  -framework AudioToolbox -framework CoreAudio -framework ServiceManagement -framework MediaPlayer
 
 # Sign with the local self-signed identity if present (see make-signing-cert.sh): the code identity
 # then stays the same across rebuilds, so macOS keeps the Bluetooth permission and login item.

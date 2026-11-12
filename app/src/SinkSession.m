@@ -1,8 +1,10 @@
 #import "SinkSession.h"
 #import "AACPlayer.h"
 #import "Log.h"
+#import "AVRCP.h"
 #import "LinkPriority.h"
 #include "latm.h"
+#include "oi_codec_sbc.h"
 #include "avdtp_frame.h"
 #import <IOBluetooth/IOBluetooth.h>
 #import <CoreBluetooth/CoreBluetooth.h>
@@ -26,13 +28,40 @@ extern char **environ;
 - (id)openL2CAPChannel:(unsigned long)psm;
 @end
 
-static const unsigned long kPSM_AVDTP = 0x19;
+static const unsigned long kPSM_AVDTP = 0x19, kPSM_AVCTP = 0x17;
 enum { AV_DISCOVER = 1, AV_GET_CAP = 2, AV_SET_CONF = 3, AV_GET_CONF = 4, AV_RECONF = 5, AV_OPEN = 6,
        AV_START = 7, AV_CLOSE = 8, AV_SUSPEND = 9, AV_ABORT = 10, AV_SECURITY = 11,
        AV_GET_ALL_CAP = 12, AV_DELAY_REPORT = 13 };
 enum { MSG_CMD = 0, MSG_GEN_REJECT = 1, MSG_ACCEPT = 2, MSG_REJECT = 3 };
 static const uint8_t kLocalSEID = 1;
-static const uint8_t kCodecAAC = 0x02;
+static const uint8_t kCodecSBC = 0x00, kCodecAAC = 0x02;
+
+// SBC frame length from its header (A2DP spec 12.9); -1 if this isn't a frame header.
+static int sbcFrameLength(const uint8_t *f, size_t n) {
+    if (n < 3 || f[0] != 0x9C) return -1;
+    int blocks = 4 * (((f[1] >> 4) & 3) + 1), mode = (f[1] >> 2) & 3, subbands = (f[1] & 1) ? 8 : 4, bitpool = f[2];
+    int ch = mode == 0 ? 1 : 2;
+    int bits = mode < 2 ? blocks * ch * bitpool : (mode == 3 ? subbands : 0) + blocks * bitpool;
+    return 4 + (4 * subbands * ch) / 8 + (bits + 7) / 8;
+}
+
+// Length of one SBC media payload (1-byte header + frames): 0 ok, -2 incomplete, -1 invalid.
+// The media socket is a byte stream, so this is what separates merged packets.
+static int sbcPayloadLength(const uint8_t *p, size_t n, size_t *len) {
+    if (n < 4) return -2;
+    int frames = p[0] & 0x0F;
+    if (frames == 0 || (p[0] & 0x80)) return -1;   // fragmented frames aren't used at A2DP packet sizes
+    size_t off = 1;
+    for (int i = 0; i < frames; i++) {
+        if (n - off < 3) return -2;
+        int fl = sbcFrameLength(p + off, n - off);
+        if (fl < 0) return -1;
+        off += (size_t)fl;
+        if (off > n) return -2;
+    }
+    *len = off;
+    return 0;
+}
 // What we tell a source that asks about our endpoint: audio sink, AAC LC 44.1/48 kHz stereo + delay reporting.
 static const uint8_t kSinkCaps[] = {0x01, 0x00, 0x07, 0x08, 0x00, 0x02, 0x80, 0x01, 0x8C, 0x84, 0xE2, 0x00, 0x08, 0x00};
 
@@ -60,6 +89,7 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
 @property(readwrite) double bitrateKbps, delayMs;
 @property(readwrite) uint64_t underruns, lostPackets;
 @property(readwrite, copy) NSString *codecDescription;
+@property(readwrite, strong) BABAVRCP *avrcp;
 @property(atomic, strong) AACPlayer *player;   // shared by the media thread and the main thread
 @end
 
@@ -83,6 +113,13 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
     double _lastTickTime;
     // media thread state
     LatmState _latm;
+    uint8_t _codec;                 // kCodecAAC or kCodecSBC, chosen in SET_CONF
+    int _sampleRate;                // configured rate (SBC; AAC takes it from the stream)
+    int _sbcSEID;                   // remote SBC endpoint seen while looking for AAC (0 = none)
+    uint8_t _sbcCaps[4];
+    BOOL _aac48k;                   // the AAC endpoint offers 48 kHz
+    OI_CODEC_SBC_DECODER_CONTEXT _sbcContext;
+    uint32_t _sbcData[CODEC_DATA_WORDS(2, SBC_CODEC_FAST_FILTER_BUFFERS)];
     volatile BOOL _playerNeedsRestart;
     uint64_t _mediaBytes, _lastBytes, _mediaPackets;
 }
@@ -106,7 +143,7 @@ static void collectFrame(const uint8_t *f, size_t n, void *ctx) {
 
 - (void)setVolume:(float)volume {
     _volume = volume;
-    self.player.volume = volume;
+    self.player.volume = volume;   // gain on the received audio; the source's volume is AppDelegate's business
 }
 
 - (void)setOutputDeviceUID:(NSString *)uid {
@@ -159,7 +196,10 @@ static const int kMaxSignalingAttempts = 5;
     _peer = [_dev classicPeer] ?: _peer;
     __weak SinkSession *ws = self;
     [_peer setConnectL2CAPCallback:^(CBL2CAPChannel *ch, long code) {
-        dispatch_async(dispatch_get_main_queue(), ^{ [ws signalingOpened:ch code:code]; });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (ch.PSM == kPSM_AVCTP) [ws avrcpOpened:ch];
+            else [ws signalingOpened:ch code:code];
+        });
     }];
     [_peer openL2CAPChannel:kPSM_AVDTP];
     [_signalingRetry invalidate];
@@ -187,6 +227,7 @@ static const int kMaxSignalingAttempts = 5;
     BABLog(@"Session ended: %@", reason);
     self.endReason = reason;
     [BABLinkPriority.shared disable];
+    [self.avrcp close];
     [_tick invalidate]; _tick = nil;
     [_connectTimeout invalidate]; _connectTimeout = nil;
     [_signalingRetry invalidate]; _signalingRetry = nil;
@@ -225,6 +266,16 @@ static const int kMaxSignalingAttempts = 5;
     [_in open]; [_out open];
     BABLog(@"Signaling channel open");
     [self cmd:AV_DISCOVER payload:NULL len:0];
+    // Take the remote-control channel before the source opens one to macOS (which would keep it).
+    if (![NSUserDefaults.standardUserDefaults objectForKey:@"avrcpEnabled"] || [NSUserDefaults.standardUserDefaults boolForKey:@"avrcpEnabled"])
+        [_peer openL2CAPChannel:kPSM_AVCTP];
+}
+
+- (void)avrcpOpened:(CBL2CAPChannel *)ch {
+    if (_ending || self.avrcp) return;
+    BABAVRCP *a = [[BABAVRCP alloc] initWithChannel:ch];
+    self.avrcp = a;
+    if ([self.delegate respondsToSelector:@selector(sinkSessionDidOpenAVRCP:)]) [self.delegate sinkSessionDidOpenAVRCP:self];
 }
 
 - (void)stream:(NSStream *)s handleEvent:(NSStreamEvent)e {
@@ -283,10 +334,15 @@ static const int kMaxSignalingAttempts = 5;
         break;
     case AV_GET_CAP: case AV_GET_ALL_CAP: {
         BOOL aac = NO;
-        for (size_t i = 0; i + 1 < pl; i += 2 + p[i + 1])
-            if (p[i] == 7 && p[i + 1] >= 2 && p[i + 3] == kCodecAAC) aac = YES;
-        if (aac && !_configured) [self configureAAC];
-        else if (!_configured) [self queryNextEndpoint];
+        for (size_t i = 0; i + 1 < pl && i + 2 + p[i + 1] <= pl; i += 2 + p[i + 1]) {
+            if (p[i] != 7 || p[i + 1] < 2) continue;   // media codec capability
+            if (p[i + 3] == kCodecAAC) { aac = YES; _aac48k = p[i + 1] >= 5 && (p[i + 6] & 0x80); }
+            if (p[i + 3] == kCodecSBC && p[i + 1] >= 6 && !_sbcSEID) { _sbcSEID = _remoteSEID; memcpy(_sbcCaps, p + i + 4, 4); }
+        }
+        if (_configured) break;
+        // Diagnostics: `defaults write local.bluetooth-audio-bridge sbcForce -bool YES` skips AAC (with sbcEnabled).
+        if (aac && ![NSUserDefaults.standardUserDefaults boolForKey:@"sbcForce"]) [self configureAAC];
+        else [self queryNextEndpoint];
         break;
     }
     case AV_SET_CONF:
@@ -305,25 +361,63 @@ static const int kMaxSignalingAttempts = 5;
 }
 
 - (void)queryNextEndpoint {
-    if (_pendingSEIDs.count == 0) { [self endWithReason:@"Device offers no AAC audio source"]; return; }
+    if (_pendingSEIDs.count == 0) {
+        if (_sbcSEID && [NSUserDefaults.standardUserDefaults boolForKey:@"sbcEnabled"]) { [self configureSBC]; return; }
+        [self endWithReason:_sbcSEID ? @"Device only offers SBC (turn on SBC in the menu)" : @"Device offers no AAC audio source"];
+        return;
+    }
     _remoteSEID = _pendingSEIDs.firstObject.unsignedCharValue;
     [_pendingSEIDs removeObjectAtIndex:0];
     uint8_t s = (uint8_t)(_remoteSEID << 2);
     [self cmd:AV_GET_ALL_CAP payload:&s len:1];
 }
 
+// 48 kHz when the source offers it: frames are shorter, so ~9% more bit rate fits the 672-byte packets,
+// and phones (which mix at 48 kHz) don't have to resample. `aacSampleRate` = 44100 forces 44.1 kHz.
+- (BOOL)use48k:(BOOL)offered {
+    return offered && [NSUserDefaults.standardUserDefaults integerForKey:@"aacSampleRate"] != 44100;
+}
+
 - (void)configureAAC {
-    // Default 320 kbit/s; the source caps it to what fits the packet size (~225-235 kbit/s).
+    // Default 320 kbit/s; the source caps it to what fits the packet size (~225-245 kbit/s).
     NSInteger kbps = [NSUserDefaults.standardUserDefaults integerForKey:@"aacBitrate"];
     uint32_t bps = (uint32_t)((kbps >= 64 && kbps <= 320) ? kbps : 320) * 1000;
+    BOOL r48 = [self use48k:_aac48k];
     uint8_t conf[] = {(uint8_t)(_remoteSEID << 2), (uint8_t)(kLocalSEID << 2),
                       0x01, 0x00,                 // media transport
                       0x07, 0x08, 0x00, 0x02,     // audio, MPEG-2/4 AAC
                       0x80,                       // MPEG-2 AAC LC
-                      0x01, 0x04,                 // 44.1 kHz, stereo
+                      r48 ? 0x00 : 0x01, r48 ? 0x84 : 0x04,   // 48 or 44.1 kHz, stereo
                       (uint8_t)(bps >> 16 & 0x7F), (uint8_t)(bps >> 8), (uint8_t)bps,   // CBR, bit rate
                       0x08, 0x00};                // delay reporting
-    BABLog(@"Requesting AAC at %u kbit/s", bps / 1000);
+    _codec = kCodecAAC;
+    _sampleRate = r48 ? 48000 : 44100;
+    self.codecDescription = r48 ? @"AAC 48 kHz" : @"AAC 44.1 kHz";
+    BABLog(@"Requesting AAC %d Hz at %u kbit/s", _sampleRate, bps / 1000);
+    [self cmd:AV_SET_CONF payload:conf len:sizeof conf];
+}
+
+// Fallback for sources without AAC (only when turned on): the best SBC the source allows.
+- (void)configureSBC {
+    _remoteSEID = (uint8_t)_sbcSEID;
+    const uint8_t *c = _sbcCaps;
+    BOOL r48 = [self use48k:(c[0] & 0x10) != 0];
+    uint8_t freq = r48 ? 0x10 : 0x20;
+    uint8_t mode = (c[0] & 0x01) ? 0x01 : (c[0] & 0x02) ? 0x02 : (c[0] & 0x04) ? 0x04 : 0x08;   // joint, stereo, dual, mono
+    uint8_t blocks = (c[1] & 0x10) ? 0x10 : (c[1] & 0x20) ? 0x20 : (c[1] & 0x40) ? 0x40 : 0x80; // 16, 12, 8, 4
+    uint8_t bands = (c[1] & 0x04) ? 0x04 : 0x08;                                                // 8, 4
+    uint8_t alloc = (c[1] & 0x01) ? 0x01 : 0x02;                                                // loudness, SNR
+    uint8_t minBP = MAX(2, c[2]), maxBP = MAX(minBP, c[3]);
+    uint8_t conf[] = {(uint8_t)(_remoteSEID << 2), (uint8_t)(kLocalSEID << 2),
+                      0x01, 0x00,
+                      0x07, 0x06, 0x00, kCodecSBC,
+                      (uint8_t)(freq | mode), (uint8_t)(blocks | bands | alloc), minBP, maxBP,
+                      0x08, 0x00};
+    _codec = kCodecSBC;
+    _sampleRate = r48 ? 48000 : 44100;
+    self.codecDescription = [NSString stringWithFormat:@"SBC %s kHz", r48 ? "48" : "44.1"];
+    OI_CODEC_SBC_DecoderReset(&_sbcContext, _sbcData, sizeof _sbcData, 2, 2, FALSE);
+    BABLog(@"Requesting SBC %d Hz, bitpool %d-%d (source offers %02x %02x %02x %02x)", _sampleRate, minBP, maxBP, c[0], c[1], c[2], c[3]);
     [self cmd:AV_SET_CONF payload:conf len:sizeof conf];
 }
 
@@ -431,7 +525,6 @@ static const int kMaxSignalingAttempts = 5;
     _activity = [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep |
                                                                      NSActivityLatencyCritical
                                                              reason:@"Receiving Bluetooth audio"];
-    self.codecDescription = @"AAC";
     self.state = SinkStateReady;
     BABLog(@"Audio channel open; ready for audio");
     NSUUID *peerID = [(id)_peer respondsToSelector:@selector(identifier)] ? [(CBPeer *)_peer identifier] : nil;
@@ -463,14 +556,16 @@ static const int kMaxSignalingAttempts = 5;
             size_t off = 12 + 4 * (b[0] & 0x0F);
             if (have - pos <= off) break;
             size_t used = 0;
-            int r = latm_parse(&_latm, b + off, have - pos - off, NULL, NULL, &used);
+            int r = _codec == kCodecSBC ? sbcPayloadLength(b + off, have - pos - off, &used)
+                                        : latm_parse(&_latm, b + off, have - pos - off, NULL, NULL, &used);
             if (r == -2) break;                                      // incomplete
             if (r < 0) { pos++; continue; }                          // garbage: resync
             uint16_t seq = (uint16_t)(b[2] << 8 | b[3]);
             if (lastSeq >= 0 && seq != (uint16_t)(lastSeq + 1)) self.lostPackets += (uint16_t)(seq - lastSeq - 1);
             lastSeq = seq;
             _mediaPackets++;
-            [self playLATM:b + off len:used];
+            if (_codec == kCodecSBC) [self playSBC:b + off len:used];
+            else [self playLATM:b + off len:used];
             pos += off + used;
         }
         memmove(buf, buf + pos, have - pos);
@@ -486,24 +581,52 @@ static const int kMaxSignalingAttempts = 5;
     });
 }
 
-- (void)playLATM:(const uint8_t *)p len:(size_t)n {
-    FrameBatch batch;
-    batch.count = 0;
-    if (latm_parse(&_latm, p, n, collectFrame, &batch, NULL) < 0) return;
+// The player for the current stream, (re)created on the first frame or after an output change.
+- (AACPlayer *)playerWithRate:(int)rate channels:(int)channels asc:(const uint8_t *)asc {
     AACPlayer *player = self.player;
     if (_playerNeedsRestart && player) { [player stop]; player = nil; self.player = nil; }
     if (!player) {
         _playerNeedsRestart = NO;
-        player = [[AACPlayer alloc] initWithSampleRate:_latm.sampleRate channels:_latm.channels asc:_latm.asc
+        player = [[AACPlayer alloc] initWithSampleRate:rate channels:channels asc:asc
                                              deviceUID:self.outputDeviceUID playback:YES];
-        if (!player) return;
+        if (!player) return nil;
         player.volume = self.volume;
         self.player = player;
-        BABLog(@"Playing AAC %d Hz %d ch on %@", _latm.sampleRate, _latm.channels, self.outputDeviceUID ?: @"default output");
+        BABLog(@"Playing %@ %d Hz %d ch on %@", asc ? @"AAC" : @"SBC", rate, channels, self.outputDeviceUID ?: @"default output");
     }
-    for (int i = 0; i < batch.count; i++) [player decodeFrame:batch.buf[i] length:batch.len[i]];
     if (self.state == SinkStateReady)   // audio without a START we parsed (e.g. merged signaling message)
         dispatch_async(dispatch_get_main_queue(), ^{ if (!self->_ending) self.state = SinkStateStreaming; });
+    return player;
+}
+
+- (void)playLATM:(const uint8_t *)p len:(size_t)n {
+    FrameBatch batch;
+    batch.count = 0;
+    if (latm_parse(&_latm, p, n, collectFrame, &batch, NULL) < 0) return;
+    AACPlayer *player = [self playerWithRate:_latm.sampleRate channels:_latm.channels asc:_latm.asc];
+    for (int i = 0; i < batch.count; i++) [player decodeFrame:batch.buf[i] length:batch.len[i]];
+}
+
+- (void)playSBC:(const uint8_t *)p len:(size_t)n {
+    AACPlayer *player = [self playerWithRate:_sampleRate channels:2 asc:NULL];
+    if (!player) return;
+    const OI_BYTE *data = p + 1;   // skip the media payload header
+    uint32_t bytes = (uint32_t)(n - 1);
+    int16_t pcm[SBC_MAX_BLOCKS * SBC_MAX_BANDS * 2];
+    float out[SBC_MAX_BLOCKS * SBC_MAX_BANDS * 2];
+    while (bytes > 0) {
+        uint32_t outBytes = sizeof pcm;
+        OI_STATUS st = OI_CODEC_SBC_DecodeFrame(&_sbcContext, &data, &bytes, pcm, &outBytes);
+        if (st != OI_OK) { BABLog(@"SBC decode error %d", (int)st); break; }
+        int ch = _sbcContext.common.frameInfo.nrof_channels;
+        size_t frames = outBytes / sizeof(int16_t) / (size_t)ch;
+        for (size_t i = 0; i < frames; i++) {
+            float l = pcm[i * ch] / 32768.0f;
+            out[2 * i] = l;
+            out[2 * i + 1] = ch == 2 ? pcm[i * ch + 1] / 32768.0f : l;
+        }
+        [player pushPCM:out frames:frames];
+    }
 }
 
 - (void)tick {

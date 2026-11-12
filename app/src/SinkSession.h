@@ -14,7 +14,10 @@ typedef NS_ENUM(NSInteger, SinkState) {
 @class SinkSession;
 @protocol SinkSessionDelegate <NSObject>
 - (void)sinkSessionDidChangeState:(SinkSession *)session;   // always called on the main thread
+@optional
+- (void)sinkSessionDidOpenAVRCP:(SinkSession *)session;     // session.avrcp is ready (main thread)
 @end
+@class BABAVRCP;
 
 @interface SinkSession : NSObject
 - (instancetype)initWithAddress:(NSString *)address;
@@ -30,6 +33,7 @@ typedef NS_ENUM(NSInteger, SinkState) {
 @property(readonly) double delayMs;
 @property(readonly) uint64_t underruns, lostPackets;
 @property(readonly, copy) NSString *codecDescription;
+@property(readonly, strong) BABAVRCP *avrcp;   // remote control of the source, nil if it couldn't be opened
 
 - (void)start;
 - (void)stop;   // graceful AVDTP CLOSE, then tear down; ends with state Ended
