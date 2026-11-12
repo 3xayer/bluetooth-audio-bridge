@@ -1,28 +1,27 @@
 # Bluetooth Audio Bridge
 
 A macOS menu bar app that turns your Mac into a **Bluetooth speaker for a Fire TV, an Android phone**
-or another Bluetooth audio source. The audio is received over Bluetooth (A2DP, AAC or optionally
-SBC) and played on any of the Mac's outputs: built-in speakers, a monitor, a USB headset, etc.
+or another Bluetooth audio source. The audio arrives over Bluetooth (A2DP, AAC or optionally SBC) and
+plays on any of the Mac's outputs: built-in speakers, a monitor, a USB headset, etc.
 
 macOS can't do this on its own: it only *sends* Bluetooth audio. This app implements the receiving
 side itself.
 
+Tested on macOS 27 (Apple silicon) with a Fire TV Stick 4K Max and a Pixel 8 Pro. Building needs only
+clang (Xcode Command Line Tools), no Xcode project.
+
 ## How it works
 
-1. **Pairing (one time).** Fire TV's "Add Bluetooth device" list hides computers, so a tiny helper app
-   on the Fire TV (installed over ADB) starts the pairing with the Mac.
-2. **Connecting.** The Mac connects to the Fire TV and opens the A2DP audio channels itself
-   (AVDTP over L2CAP), the same way headphones reconnect to a phone. The Fire TV then treats the Mac
-   like a pair of Bluetooth headphones and routes its audio there.
-3. **Audio.** The stream is AAC (LATM inside RTP). It's decoded with macOS's own AAC decoder and played
-   through an adaptive jitter buffer. Playback speed is nudged by up to ±1–2% to absorb bursts and
+1. **Connecting.** The Mac connects to the paired source and opens the A2DP audio channels itself
+   (AVDTP over L2CAP), the same way headphones reconnect to a phone. The source then treats the Mac
+   like Bluetooth headphones and routes its audio there.
+2. **Audio.** AAC (LATM inside RTP) is decoded with macOS's own decoder, SBC with Android's. Playback
+   runs through an adaptive jitter buffer, and its speed is nudged by up to ±1–2% to absorb bursts and
    clock drift without dropouts.
-4. **Lip sync.** The Mac reports its real playback delay to the Fire TV (AVDTP delay reporting), so
-   apps shift video to match.
-5. **Remote control.** The app also opens the AVRCP channel itself: the menu and the Mac's media keys
-   play, pause and skip on the source, the current title shows in the menu and in Control Center's
-   Now Playing, and a source that uses absolute volume (the Fire TV does) changes the Mac's volume
-   with its own volume buttons (and follows the Mac's volume keys).
+3. **Lip sync.** The Mac reports its real playback delay to the source (AVDTP delay reporting), so
+   video apps shift the picture to match.
+4. **Remote control.** The app also opens the AVRCP channel itself: play, pause and skip from the menu
+   or the Mac's media keys, the current title in the menu and in Now Playing, and absolute volume.
 
 ## Setup
 
@@ -33,19 +32,16 @@ app/make-signing-cert.sh   # once per Mac: local self-signed code-signing identi
 app/build.sh install
 ```
 
-This builds `Bluetooth Audio Bridge.app`, signs it, copies it to `/Applications` and starts it. On
-first launch, allow Bluetooth access when macOS asks. With the local signing identity, rebuilds keep
-the same code identity, so macOS doesn't ask again and the login item keeps working.
+This builds the app, signs it, copies it to `/Applications` and starts it. On first launch, allow
+Bluetooth access. The local signing identity keeps that permission across rebuilds.
 
 ### 2. Pair your source with the Mac (once)
 
 **Fire TV.** Its "Add Bluetooth device" list hides computers, so a small helper app on the Fire TV
 starts the pairing. On the Fire TV: **Settings → My Fire TV → Developer options → ADB debugging: ON**
-(if Developer options is missing: *About* → click the device name 7×). Note the IP address under
-*About → Network*.
-
-On the Mac (needs `adb`, e.g. `brew install android-platform-tools`, plus the Android SDK platform 30
-and build-tools to build the helper the first time):
+(if Developer options is missing: *About* → click the device name 7×), and note the IP address under
+*About → Network*. Then on the Mac (needs `adb`, e.g. `brew install android-platform-tools`, plus the
+Android SDK platform 30 and build-tools to build the helper the first time):
 
 ```bash
 firetv-helper/pair.sh <fire-tv-ip>
@@ -60,84 +56,63 @@ shows up as a computer) and confirm the code on both sides.
 ### 3. Pick it in the menu
 
 Choose the device under **Connect To**. Tick it under **Connect Automatically** if the app should
-connect to it on its own (a Fire TV that was already paired when the app first started is ticked
-for you). Leave phones unticked, so the app doesn't take a phone's audio away from your headphones.
-
-### Tests
-
-Unit tests (AVDTP message splitting, the jitter buffer/resampler, and the LATM parser):
-
-```bash
-app/tests/run.sh
-```
+connect to it on its own (a Fire TV that was already paired when the app first started is ticked for
+you). Leave phones unticked, so the app doesn't take a phone's audio away from your headphones.
 
 ## Using it
 
-The menu bar icon shows the state: 🔈 connecting/not connected · hi-fi speaker = connected ·
-filled = playing.
-
 | Menu item | What it does |
 |---|---|
-| **Now playing** | Title and artist from the source's player, with Previous / Play-Pause / Next buttons. The Mac's media keys do the same. |
-| **Receive Audio** | On: connect and reconnect. Off: disconnect, and the source goes back to its normal audio output (TV speakers/HDMI, phone speaker). |
-| **Reconnect Now** | Drop and re-establish the connection. |
-| **Volume** | The Mac's output volume, kept in step with the source's volume buttons (absolute volume). If the output device has no volume control (some HDMI/DisplayPort outputs), it scales the received audio instead. |
-| **Connect To** | Connect to this paired audio source now (a spinner shows while it connects); click it again to disconnect. A disconnected device isn't reconnected automatically until you pick it again. A device picked here gets a few tries if it isn't reachable, then the automatic devices take over again. |
-| **Connect Automatically** | Devices the app connects to on its own and reconnects to (by default the Fire TV). Leave phones off, so the app doesn't take a phone's audio away from your headphones whenever it's in range. |
-| **Allow SBC** | For devices that don't offer AAC. Off by default; AAC is always preferred. |
-| **Output** | Where to play: System Default or a specific device. Can be switched while playing. |
-| **Open at Login** | Start automatically (works best with the app in /Applications). |
+| **Now playing** | Title and artist from the source's player, with Previous / Play-Pause / Next. The Mac's media keys do the same. |
+| **Volume** | The Mac's output volume, in step with the source's volume buttons (absolute volume). Outputs without a volume control (some HDMI/DisplayPort) scale the received audio instead. |
+| **Receive Audio** | Off: disconnect, and the source goes back to its own output (TV speakers, phone speaker). |
+| **Connect To** | Connect to a paired source now; click it again to disconnect. A disconnected device stays disconnected until you pick it again. |
+| **Connect Automatically** | Devices the app connects and reconnects to on its own. |
+| **Allow SBC** | For devices without AAC. Off by default; AAC is always preferred. |
 | **Show Log** | `~/Library/Logs/Bluetooth Audio Bridge.log` |
-
-While the app is connected, the source sends audio **only** to the Mac. Turn **Receive Audio** off
-to hear the TV again.
 
 ## Good to know
 
-- **Quality:** AAC LC stereo at about 225 kbit/s (44.1 kHz, Fire TV) or 245 kbit/s (48 kHz, used when
-  the source offers it, as phones do). Sources cap AAC frames to the Bluetooth packet size macOS uses
-  (672 bytes). SBC, if allowed, runs at the source's best setting (about 330 kbit/s on Android).
-  LDAC isn't expected to start: Sony's encoder needs at least 679 bytes (open decoders do exist).
+- **Quality:** AAC LC stereo at about 225 kbit/s (44.1 kHz), or about 245 kbit/s at 48 kHz when a source
+  offers it. Sources cap AAC frames to the Bluetooth packet size macOS uses (672 bytes). SBC, if
+  allowed, runs at the source's best setting (about 330 kbit/s on Android). LDAC can't start: Sony's
+  encoder needs at least 679-byte packets (open decoders do exist).
 - **Latency:** Each stream starts with a 200 ms buffer, which shrinks to 120 ms while the link is clean
-  and grows (up to 300 ms) after dropouts. Total delay is about 160–300 ms. It's compensated for video
-  via delay reports.
-- **Remote volume:** Through the app's own AVRCP channel the Fire TV uses absolute volume: its remote
-  changes the Mac's volume, and the Mac's volume keys move the Fire TV's level. Sources that don't
-  support it scale the audio themselves instead.
-- **Radio priority:** The Mac's Bluetooth chip also runs BLE scans and device searches. The biggest
-  one: with AirPods set to switch automatically, macOS scans 30 ms out of every 40 ms for ~15 s each
-  time you use the Mac after a short break. Without priority, the Fire TV's audio then gets only
-  ~60% through and drops out. The app therefore marks the Fire TV link as a high-priority stream
-  while it's connected (private bluetoothd message). In tests, the 75% scan and back-to-back device
-  searches then no longer cause dropouts. Waking the screen from sleep can still cause a ~2 s
-  hiccup. To turn it off: `defaults write local.bluetooth-audio-bridge linkPriority -bool NO`.
-  Active AirDrop transfers can cause brief stutters too. After any stall the app catches up
-  immediately instead of staying behind.
+  and grows up to 300 ms after dropouts. Total delay is about 160–300 ms, compensated for video via
+  delay reports.
+- **Radio priority:** The Mac's Bluetooth chip also runs BLE scans and device searches. The biggest:
+  with AirPods set to switch automatically, macOS scans 30 ms out of every 40 ms for ~15 s each time
+  you use the Mac after a short break, and without priority the source's audio only gets ~60%
+  through. So while connected, the app marks the link as a high-priority stream (private bluetoothd
+  message); in tests, these scans and device searches then no longer cause dropouts. Waking the
+  screen can still cause a ~2 s hiccup, and AirDrop transfers brief stutters. To turn the priority
+  off: `defaults write local.bluetooth-audio-bridge linkPriority -bool NO`.
 - **Lower bit rate (optional):** `defaults write local.bluetooth-audio-bridge aacBitrate -int 128`
-  asks the Fire TV for 128 kbit/s AAC, which leaves more headroom for radio interference at some cost
-  in sound quality. Remove the key to go back to the maximum.
+  leaves more headroom for radio interference at some cost in sound quality. Delete the key to go
+  back to the maximum.
 - **Diagnostics:** `defaults write local.bluetooth-audio-bridge perSecondStats -bool YES` logs the
-  received rate every second. `probe/stall-test.py` uses it to fire individual system events
-  (BLE scan, device search, Wi-Fi scan, CPU/disk/network load, ...) and report which ones cause stalls.
-- **Fragility:** The app uses **private macOS Bluetooth APIs** (`CBClassicPeer`), because the
-  public ones can't open these channels any more. A future macOS update may break it.
-- **Reconnects:** Reconnects after the connection drops and after the Mac wakes from sleep. With
-  several automatic devices it takes turns; when none is reachable, it retries with backoff (up to
-  once a minute).
+  received rate every second. `probe/stall-test.py` uses it to fire single system events (BLE scan,
+  device search, Wi-Fi scan, CPU/disk/network load, ...) and reports which ones cause stalls.
+- **Fragility:** The app relies on **private macOS Bluetooth APIs** (`CBClassicPeer`, bluetoothd
+  messages), because the public ones can't open these channels any more. A future macOS update may
+  break it.
 
 ## Project layout
 
 ```
-app/            The menu bar app (Objective-C, built with clang; no Xcode project needed)
+app/                  The menu bar app (Objective-C)
   src/SinkSession.m   A2DP sink: AVDTP signaling, codec choice (AAC/SBC), media channel, delay reports
-  src/AACPlayer.m     AAC decode (AudioToolbox) + adaptive jitter buffer + output
+  src/AACPlayer.m     AAC decoding (AudioToolbox), adaptive jitter buffer, output
+  src/latm.c          LATM/LOAS parser for A2DP AAC payloads
   src/AVRCP.m         Remote control: play/pause/skip, titles, absolute volume
   src/LinkPriority.m  Radio priority for the audio link
-  third_party/sbc/    Android's SBC decoder (Apache-2.0)
-  src/latm.c          LATM/LOAS parser for A2DP AAC payloads
   src/AppDelegate.m   Menu bar UI, settings, reconnect logic
-firetv-helper/  Android helper app + pair.sh (one-time pairing over ADB)
-probe/          Development/diagnostic tool used while building this (scan, caps, raw capture, decode tests)
+  src/MenuViews.m     Menu rows, player card and volume slider
+  src/SystemVolume.m  The Mac's output volume
+  third_party/sbc/    Android's SBC decoder
+  tests/run.sh        Unit tests (AVDTP message splitting, jitter buffer/resampler, LATM parser)
+firetv-helper/        Android helper app + pair.sh (one-time Fire TV pairing over ADB)
+probe/                Development and diagnostic tool (scan, caps, raw capture, decode and stall tests)
 ```
 
 ## License
